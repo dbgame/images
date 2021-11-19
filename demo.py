@@ -4,7 +4,7 @@ import os.path as osp
 import json
 import sys
 sys.path.append("/mnt/efs/packages")
-sys.path.append("/mnt/efs")
+sys.path.append("/mnt/efs/stoke_portrait")
 import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms

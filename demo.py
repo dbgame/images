@@ -1,15 +1,24 @@
+import json 
 import os
 import os.path as osp
+import boto3
 
 import json
 import sys
-sys.path.append("/mnt/efs/packages")
-sys.path.append("/mnt/efs/stoke_portrait")
+#sys.path.append("/mnt/efs/packages")
+#sys.path.append("/mnt/efs/stroke_portrait")
+
+#sys.path.insert(0, '/mnt/efs/packages')
+#sys.path.insert(1, '/mnt/efs/stroke_portrait')
+
 import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms
 import cv2
-import matplotlib.pyplot as plt
+
+#import check_matplotlib_support
+#check_matplotlib_support('plot_partial_dependence')
+#import matplotlib.pyplot as plt 
 
 import argparse
 import torch
@@ -19,10 +28,12 @@ from model import BiSeNet
 from painter import *
 import time
 
+
+
 # settings
 parser = argparse.ArgumentParser(description='Stroke Portrait')
-parser.add_argument('--iters_per_stroke', type=int, default=50)
-parser.add_argument('--img_path', type=str, default='./output/abc.jpeg', metavar='str',
+parser.add_argument('--iters_per_stroke', type=int, default=15)
+parser.add_argument('--img_path', type=str, default='./output/input.png', metavar='str',
                     help='path to test image (default: ./test_images/apple.jpg)')
 parser.add_argument('--renderer', type=str, default='markerpen', metavar='str',
                     help='renderer: [watercolor, markerpen, oilpaintbrush, rectangle (default oilpaintbrush)')
@@ -49,7 +60,7 @@ parser.add_argument('--renderer_checkpoint_dir', type=str, default=r'./checkpoin
                     help='dir to load neu-renderer (default: ./checkpoints_G_oilpaintbrush_light)')
 parser.add_argument('--lr', type=float, default=0.002,
                     help='learning rate for stroke searching (default: 0.005)')
-parser.add_argument('--output_dir', type=str, default='./output', metavar='str',
+parser.add_argument('--output_dir', type=str, default='/tmp', metavar='str',
                     help='dir to save painting results (default: ./output)')
 parser.add_argument('--output_filename', type=str, default='portrait-final.png', metavar='str',
                     help='dir to save painting results (default: ./output)')
@@ -62,8 +73,9 @@ args = parser.parse_args()
 os.makedirs(args.output_dir, exist_ok=True)
 
 # Decide which device we want to run on
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# print(torch.cuda.get_device_name(device))
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+device = torch.device("cpu")
 
 def vis_parsing_maps(im, parsing_anno, stride, save_im=False):
     im = np.array(im)
@@ -72,6 +84,7 @@ def vis_parsing_maps(im, parsing_anno, stride, save_im=False):
     vis_parsing_anno = cv2.resize(vis_parsing_anno, None, fx=stride, fy=stride, interpolation=cv2.INTER_NEAREST)
 
     # Save result or not    
+    '''
     if save_im:
         vis_parsing_anno_color = np.zeros((vis_parsing_anno.shape[0], vis_parsing_anno.shape[1], 3)) + 255        
         # Colors for all 20 parts
@@ -95,16 +108,13 @@ def vis_parsing_maps(im, parsing_anno, stride, save_im=False):
         # print(vis_parsing_anno_color.shape, vis_im.shape)
         vis_im = cv2.addWeighted(cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR), 0.4, vis_parsing_anno_color, 0.6, 0)
         cv2.imwrite(f"{args.output_dir}/face_map.png", vis_im, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-
+    '''
     return vis_parsing_anno
 
 def evaluate(img_path, checkpoint_path):
 
-    #net = BiSeNet(n_classes=19).cuda()
     net = BiSeNet(n_classes=19)
-
-    #print(torch.cuda.is_available(device))
-
+        
     net.load_state_dict(torch.load(checkpoint_path, map_location=device))
     net.eval()
 
@@ -117,14 +127,16 @@ def evaluate(img_path, checkpoint_path):
         img = Image.open(osp.join(img_path)).convert('RGB')
         image = img.resize((512, 512), Image.BILINEAR)
         img = to_tensor(image)
-        img = torch.unsqueeze(img, 0) #img = torch.unsqueeze(img, 0).cuda()
+        
+        img = torch.unsqueeze(img, 0)
+        
         out = net(img)[0]
         parsing = out.squeeze(0).cpu().numpy().argmax(0)
         vis_parsing_anno = vis_parsing_maps(image, parsing, stride=1, save_im=False)
     return vis_parsing_anno
 
 
-def clamp_x():
+def clamp_x(pt):
     pt.x_ctt.data = torch.clamp(pt.x_ctt.data, 0.1, 1 - 0.1) 
     pt.x_ctt.data[:,:,-2:]= torch.clamp(pt.x_ctt.data[:,:,-2:], 0.1, 0.3) #radius
     pt.x_color.data = torch.clamp(pt.x_color.data, 0, 1)
@@ -136,22 +148,21 @@ def step(pt, CANVAS_tmp, clamp=True):
 
     # update x
     pt.optimizer_x.zero_grad()
-    clamp_x()
+    clamp_x(pt)
 
     pt._forward_pass()
 #     pt._drawing_step_states()
     pt._backward_x()
 
-    clamp_x()
+    clamp_x(pt)
     pt.optimizer_x.step()
     pt.step_id += 1    
     
 def optimize_x(pt):
 
     pt._load_checkpoint()
+    
     pt.net_G.eval()
-
-#     print('begin drawing...')
 
     PARAMS = np.zeros([1, 0, pt.rderr.d], np.float32)
 
@@ -186,24 +197,128 @@ def optimize_x(pt):
         pt.stroke_sampler(pt.anchor_id)
         for i in range(2):
             step(pt, CANVAS_tmp, clamp=True)
+            
 
     v = pt._normalize_strokes(pt.x)
     v = pt._shuffle_strokes_and_reshape(v)
     PARAMS = np.concatenate([PARAMS, v], axis=1)
     CANVAS_tmp = pt._render(PARAMS, save_jpgs=False, save_video=False)
-    CANVAS_tmp = utils.img2patches(CANVAS_tmp, pt.m_grid + 1, pt.net_G.out_size).to(device)
+    #CANVAS_tmp = utils.img2patches(CANVAS_tmp, pt.m_grid + 1, pt.net_G.out_size).to(device)
+    
 
 #     pt._save_stroke_params(PARAMS)
-    final_rendered_image = pt._render(PARAMS, save_jpgs=True, save_video=False)
+    #final_rendered_image = pt._render(PARAMS, save_jpgs=True, save_video=False)
+
+    
+    
+def init_dynamodb(table, requestId, status):
+    print('***** requestId *****', requestId)
+    print('***** status *****', status)
+    #table = dynamodb.Table('stroke-portrait-status-inventory');
+    response = table.put_item(
+        Item={
+            'requestId': requestId,
+            'status': status
+        }
+    )
+    return response
+    
+def update_dynamodb(table, requestId, status):
+    response = table.update_item(
+        Key={
+            'requestId': requestId
+        },
+        UpdateExpression="set #st=:val",
+        ExpressionAttributeValues={
+            ':val': status,
+        },
+        ExpressionAttributeNames={
+            "#st": "status"
+        },
+        ReturnValues="UPDATED_NEW"
+    )
+    return response
 
 
-
-if __name__ == '__main__':
+def lambda_handler(event, context):
+    
+    # print('***** event: ', event)
+    
+    # 0. 초기 정보 세팅
+    
+    ##-- s3 세팅
+    s3 = boto3.client('s3');
+    
+    src_bucket = event['Records'][0]['s3']['bucket']['name'];
+    src_key    = event['Records'][0]['s3']['object']['key'];
+    
+    dst_bucket = "home-service-portrait-image-v2";
+    
+    img_fileName = src_key.split('/')[-1];
+    img_name     = img_fileName.split('.')[0];
+    img_ext      = img_fileName.split('.')[-1];
+    img_fileName_dst = 'portrait-{}'.format(img_fileName);
+    
+    ##-- s3 경로 세팅
+    path_s3_src = src_key;
+    #path_s3_dst = 'completed/{}'.format(img_fileName_dst);
+    path_s3_dst = '{}'.format(img_fileName_dst);
+    
+    ##-- tmp 경로 세팅
+    path_tmp_src  = '/tmp/{}'.format(img_fileName);
+    path_tmp_dst    = '/tmp/{}'.format(img_fileName_dst);
+    
+    print('***** Debug 01 *****')
+    
+    print('***** Debug 02 *****')
+    ##-- database 초기화
+    dynamodb = boto3.resource('dynamodb', region_name="ap-northeast-2");
+    table = dynamodb.Table('stroke-portrait-status-inventory');
+    init_dynamodb(table, img_name, 'running')
+    
+    
+    ###-- DEBUG
+    print('***** bucket: ', src_bucket)
+    print('***** path_s3_src: ', path_s3_src)
+    print('***** path_tmp_src: ', path_tmp_src)
+    print('***** path_s3_dst: ', path_s3_dst)
+    print('***** path_tmp_dst: ', path_tmp_dst)
+    #print('***** python3 -V: ', os.system("python3 -V"))
+    #print('***** OpenBLAS: ', os.system("grep -r 'openblas' /"))
+    #print('***** CPU Info: ', os.system("cat /proc/cpuinfo"))
+    
+    
+    
+    # 1. Trigger된 Bucket에서 이미지 가져오기
+    try:
+        s3.download_file(src_bucket, path_s3_src, path_tmp_src)
+        print('***** tmp list: ', os.listdir('/tmp'))
+    except Exception as e:
+        print('Custom Error: Download Failed.'.format(path_s3_src, src_bucket))
+        return e;
+    
+    
+    # 2. Machine Learning 처리
     st = time.time()
-    args.output_filename = 'portrait-output.png'
-    face_attributes = evaluate(img_path=args.img_path, checkpoint_path='./79999_iter.pth')    
+    args.output_filename = img_fileName_dst
+    face_attributes = evaluate(img_path=path_tmp_src, checkpoint_path='./79999_iter.pth')    
     pt = ProgressivePainter(args, face_attributes)
     optimize_x(pt)
     end = time.time()
-    print(end-st)
-
+    print('***** time: ', end-st)
+    
+    
+    # 3. Bucket에 이미지 업로드
+    try:
+        s3.upload_file(path_tmp_dst, dst_bucket, path_s3_dst)
+        #s3.upload_file(path_tmp_src, dst_bucket, path_s3_src)
+    except Exception as e:
+        print('Custom Error: Upload Failed.'.format(path_s3_dst, dst_bucket));
+        return e;
+    
+    ##-- database update
+    update_dynamodb(table, img_name, "completed")
+    
+    
+    
+    
